@@ -2,23 +2,13 @@
 #include <sys/mman.h>
 #include <arpa/inet.h>
 #include <net/if.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
 #include <unistd.h>
 #include <iostream>
 
 #include "DevSniffer.h"
-
-char *hex(const char *in, int size)
-{
-    static char buf[1024];
-    int l = 0;
-    for (int i = 0; i < size; ++i)
-    {
-        l += snprintf(buf + l, sizeof buf - l,
-                      "%02hhx-", in[i]);
-    }
-    buf[l] = '\000';
-    return buf;
-}
+#include "util.h"
 
 std::ostream &operator<<(std::ostream &os, tpacket2_hdr &v)
 {
@@ -33,7 +23,7 @@ std::ostream &operator<<(std::ostream &os, tpacket2_hdr &v)
     return os;
 }
 
-std::ostream &operator<<(std::ostream &os, sockaddr_ll &v)
+std::ostream &operator<<(std::ostream &os, const sockaddr_ll &v)
 {
     os << "Sockaddr_ll:family[" << v.sll_family
        << "] protocol[" << v.sll_protocol
@@ -42,7 +32,7 @@ std::ostream &operator<<(std::ostream &os, sockaddr_ll &v)
     return os;
 }
 
-std::ostream &operator<<(std::ostream &os, ether_header &v)
+std::ostream &operator<<(std::ostream &os, const ether_header &v)
 {
     os << "Ether:type[" << v.ether_type
        << "] dst[" << hex((const char *)v.ether_dhost, sizeof v.ether_dhost)
@@ -50,7 +40,7 @@ std::ostream &operator<<(std::ostream &os, ether_header &v)
        << "]";
     return os;
 }
-std::ostream &operator<<(std::ostream &os, iphdr &v)
+std::ostream &operator<<(std::ostream &os, const iphdr &v)
 {
     struct in_addr saddr, daddr;
     saddr.s_addr = v.saddr;
@@ -133,7 +123,17 @@ void DevSniffer::OnData()
 {
     while (HasFrame())
     {
-        // TODO: handle frame
+        StreamKey sk;
+        if (CurrentKey(sk))
+        {
+            auto fnit = stream_fn_map_.find(sk);
+            if (fnit != stream_fn_map_.end())
+            {
+                std::cout << sk << std::endl;
+                fnit->second((const char *)l2(), hdr()->tp_snaplen);
+            }
+        }
+
         std::cout << "=========" << std::endl;
         std::cout << "  " << *hdr() << std::endl;
         std::cout << "  " << *addr() << std::endl;
@@ -141,4 +141,41 @@ void DevSniffer::OnData()
         std::cout << "  " << *l3() << std::endl;
         Next();
     }
+}
+
+void DevSniffer::RegisterStream(StreamKey &k, StreamCallbackFn fn)
+{
+    stream_fn_map_[k] = fn;
+}
+
+bool DevSniffer::CurrentKey(StreamKey &sk)
+{
+    switch (l3()->protocol)
+    {
+    case IPPROTO_TCP:
+    {
+        sk.protocol_ = IPPROTO_TCP;
+        auto tcp = (const tcphdr *)l4();
+        sk.port_dst_ = tcp->dest;
+        sk.port_src_ = tcp->source;
+        break;
+    }
+    case IPPROTO_UDP:
+    {
+        sk.protocol_ = IPPROTO_UDP;
+        auto udp = (const udphdr *)l4();
+        sk.port_dst_ = udp->dest;
+        sk.port_src_ = udp->source;
+        break;
+    }
+    default:
+        return false;
+    }
+
+    memcpy(sk.mac_dst_, l2()->ether_dhost, sizeof(sk.mac_dst_));
+    memcpy(sk.mac_src_, l2()->ether_shost, sizeof(sk.mac_src_));
+    sk.ip_dst_ = l3()->daddr;
+    sk.ip_src_ = l3()->saddr;
+
+    return true;
 }
